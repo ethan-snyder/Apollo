@@ -10,6 +10,6 @@ apollo_export.jsonl
 venv/
 .venv/
 
-# Proprietary scoring logic and its internal documentation — kept local only.
+# Proprietary scoring logic and its internal documentation — kept local only... for now...
 scoring.py
 SCORING_FAQ.md
