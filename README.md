@@ -10,7 +10,7 @@ scores into directional signals over multiple time horizons.
 
 Everything below is free. Nothing in the first four groups needs an API key.
 
-| Group | Sources | Why it matters |
+| Group | Sources | Relevance |
 |---|---|---|
 | Crypto trade press | CoinDesk, The Block, Blockworks, Cointelegraph, Decrypt, DL News, The Defiant, CryptoSlate, + 10 more | Fastest coverage of crypto-specific events |
 | Protocol primary sources | Ethereum Foundation, Solana, Bitcoin Core, Kraken, a16z crypto | Upgrades and incidents, ahead of press pickup |
