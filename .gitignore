@@ -1,0 +1,15 @@
+.env
+*.db
+*.db-wal
+*.db-shm
+__pycache__/
+*.pyc
+system_actions.log
+apollo_export.jsonl
+.idea/
+venv/
+.venv/
+
+# Proprietary scoring logic and its internal documentation — kept local only.
+scoring.py
+SCORING_FAQ.md

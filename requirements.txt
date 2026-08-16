@@ -1,0 +1,7 @@
+aiohttp>=3.9
+feedparser>=6.0
+python-dotenv>=1.0
+alpaca-py>=0.21
+yfinance>=0.2.40
+requests>=2.31
+certifi>=2024.2.2
