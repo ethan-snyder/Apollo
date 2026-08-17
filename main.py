@@ -17,6 +17,9 @@ Backtesting & paper trading:
     python main.py coverage                   what history is loaded
     python main.py backtest [asset] [start] [end]
     python main.py events [asset] [start] [end]   event study (CAR by category)
+    python main.py validate [asset] [start] [end] lead-lag + null controls
+    python main.py leadlag [asset] [start] [end]  lead-lag only, by lexicon half
+    python main.py controls [start] [end]     fetch non-crypto control series
     python main.py backtests                  list saved backtest runs
     python main.py paper [duration]           paper trade (default 1h, $10k)
     python main.py papers                     list saved paper runs
@@ -423,6 +426,220 @@ def do_event_study(asset: str = "BTC", start: str = "2025-01-01",
     print(f"\n  Saved as run #{res.get('run_id')}\n")
 
 
+def _leadlag_curve(res: dict, indent: str = "    ",
+                   scale: float | None = None) -> None:
+    """
+    One row per lag, with a bar so the shape of the curve is visible.
+
+    `scale` is the |IC| that fills the bar. When several curves are printed
+    together they must share one scale, or a curve whose peak is 0.04 draws
+    the same full-width bar as one whose peak is 0.45 and the comparison the
+    panels exist for becomes actively misleading.
+    """
+    scored = [l for l in res["lags"] if l.get("ic") is not None]
+    if not scored:
+        print(f"{indent}(insufficient data at every lag)")
+        return
+    peak = scale or max(abs(l["ic"]) for l in scored) or 1.0
+    print(f"{indent}{'lag':>5} {'n':>7} {'IC':>9} {'t':>7}   "
+          f"correlation (full bar = {peak:.3f})")
+    print(f"{indent}" + "-" * 62)
+    for l in res["lags"]:
+        if l.get("ic") is None:
+            print(f"{indent}{l['lag']:>+5} {l['n']:>7}   {l.get('note', '')}")
+            continue
+        cells = min(18, int(round(abs(l["ic"]) / peak * 18)))
+        bar = ("#" if l["ic"] >= 0 else "-") * cells
+        mark = "  <- peak" if l["lag"] == res["peak_lag"] else ""
+        print(f"{indent}{l['lag']:>+5} {l['n']:>7} {l['ic']:>+9.4f} "
+              f"{l['tstat']:>+7.2f}   {bar}{mark}")
+
+
+def do_leadlag(asset: str = "BTC", start: str = "2025-01-01",
+               end: str = "2026-01-01") -> None:
+    import validation
+
+    print(f"\n  Lead-lag — {asset.upper()}  {start} .. {end} ...\n")
+    res = validation.lexicon_split(asset, start, end)
+    if "error" in res:
+        print(f"  ERROR: {res['error']}\n")
+        return
+
+    full = res["subsets"]["all"]
+    print(f"{BAR}\n  LEAD-LAG — {full['asset']} ({full['symbol']})  "
+          f"{start} .. {end}\n{BAR}\n")
+    print(f"  Bars                {full['bars']:,}")
+    print(f"  Bars with news      {full['bars_with_news']:,}")
+    print(f"  Articles            {full['articles']:,}")
+    print("\n  lag  0 = the move during the same hour as the headline")
+    print("  lag +1 = the next hour (this is the backtest's fwd_1h)")
+    print("  lag -1 = the hour before the headline existed")
+
+    # One shared scale across the three panels — see _leadlag_curve.
+    shared = max(abs(l["ic"]) for sub in res["subsets"].values()
+                 for l in sub["lags"] if l.get("ic") is not None) or 1.0
+
+    for name in ("all", "event", "price_action"):
+        sub = res["subsets"][name]
+        print(f"\n  {name.upper().replace('_', ' ')}  "
+              f"— peak at lag {sub['peak_lag']:+d}  [{sub['verdict']}]")
+        _leadlag_curve(sub, scale=shared)
+
+    s = res["summary"]
+    print(f"\n  SUMMARY")
+    print(f"    event half         peak {s['event_peak_lag']:+d}  "
+          f"IC@+1 {s['event_ic_at_lag_1']:+.4f}  {s['event_verdict']}")
+    print(f"    price-action half  peak {s['price_action_peak_lag']:+d}  "
+          f"IC@+1 {s['price_action_ic_at_lag_1']:+.4f}  "
+          f"{s['price_action_verdict']}")
+    print(f"\n  {full['reading']}\n")
+
+
+def do_validate(asset: str = "BTC", start: str = "2025-01-01",
+                end: str = "2026-01-01") -> None:
+    import validation
+
+    print(f"\n  Validating {asset.upper()}  {start} .. {end} — this runs a "
+          f"bootstrap and\n  several hundred placebo studies, so give it a "
+          f"minute.\n")
+    res = validation.run_all(asset=asset, start_date=start, end_date=end)
+    t = res["tests"]
+
+    print(f"{BAR}\n  VALIDATION — {res['asset']}  {start} .. {end}\n{BAR}")
+
+    # --- lead-lag -----------------------------------------------------------
+    ll = t["lead_lag"]
+    print(f"\n  1. LEAD-LAG  —  is the signal ahead of price, or behind it?")
+    if "error" in ll:
+        print(f"     ERROR: {ll['error']}")
+    else:
+        _leadlag_curve(ll, indent="     ")
+        print(f"\n     peak lag {ll['peak_lag']:+d}   "
+              f"IC@+1 {(ll['ic_at_lag_1'] or 0):+.4f}   "
+              f"fwd/back mass ratio {ll['leadlag_ratio']}")
+        print(f"     {ll['verdict']} — {ll['reading']}")
+
+    ls = t["lexicon_split"]
+    if "summary" in ls:
+        s = ls["summary"]
+        print(f"\n     by lexicon half:")
+        print(f"       event         peak {s['event_peak_lag']:+d}  "
+              f"IC@+1 {s['event_ic_at_lag_1']:+.4f}  {s['event_verdict']}")
+        print(f"       price action  peak {s['price_action_peak_lag']:+d}  "
+              f"IC@+1 {s['price_action_ic_at_lag_1']:+.4f}  "
+              f"{s['price_action_verdict']}")
+
+    # --- bootstrap ----------------------------------------------------------
+    bs = t["block_bootstrap"]
+    print(f"\n  2. BLOCK BOOTSTRAP  —  is the IC significant against an "
+          f"honest null?")
+    if "error" in bs:
+        print(f"     ERROR: {bs['error']}")
+    else:
+        print(f"     observed IC          {bs['observed_ic']:>+9.5f}  "
+              f"(n={bs['n']:,}, horizon {bs['horizon_h']}h)")
+        print(f"     naive t-statistic    {bs['naive_tstat']:>+9.3f}  "
+              f"<- assumes independence, which returns violate")
+        print(f"     {'null':<20} {'mean':>9} {'sd':>9} {'pctile':>8} "
+              f"{'p':>8} {'z':>8}")
+        print("     " + "-" * 66)
+        for d in (bs["block"], bs["iid"]):
+            print(f"     {d['null']:<20} {d['null_mean']:>+9.5f} "
+                  f"{d['null_sd']:>9.5f} {d['percentile']:>7.1f}% "
+                  f"{d['p_value_two_sided']:>8.4f} "
+                  f"{(d['z'] or 0):>+8.2f}")
+        if bs["tstat_inflation"]:
+            print(f"\n     the naive t-stat overstates significance by "
+                  f"~{bs['tstat_inflation']}x")
+        print(f"     {bs['verdict']} — {bs['reading']}")
+
+    # --- time shift ---------------------------------------------------------
+    ts = t["time_shift"]
+    print(f"\n  3. TIME-SHIFT PLACEBO  —  does misaligning news and price "
+          f"kill it?")
+    if "error" in ts:
+        print(f"     ERROR: {ts['error']}")
+    else:
+        print(f"     true IC (no shift)   {ts['true_ic']:>+9.5f}  "
+              f"(n={ts['true_n']:,})")
+        print(f"     {'shift':>8} {'n':>8} {'IC':>10} {'retained':>10}")
+        print("     " + "-" * 40)
+        for s in ts["shifts"]:
+            ic = "     —" if s["ic"] is None else f"{s['ic']:>+10.5f}"
+            ret = ("     —" if s["retained_vs_true"] is None
+                   else f"{100 * s['retained_vs_true']:>9.1f}%")
+            print(f"     {s['shift_h']:>+7}h {s['n']:>8} {ic} {ret}")
+        print(f"     {ts['verdict']} — {ts['reading']}")
+
+    # --- placebo events -----------------------------------------------------
+    pe = t["placebo_events"]
+    print(f"\n  4. PLACEBO EVENTS  —  what does the event study find in "
+          f"random hours?")
+    if "error" in pe:
+        print(f"     ERROR: {pe['error']}")
+    else:
+        print(f"     real events {pe['real_events']:,}   "
+              f"placebo studies {pe['draws']:,}")
+        print(f"     {'measure':<18} {'real':>10} {'null mean':>11} "
+              f"{'null sd':>9} {'pctile':>8} {'p':>8}")
+        print("     " + "-" * 68)
+        for label, d in (("mean CAR %", pe["mean_car"]),
+                         ("signed by prior %", pe["signed_car"])):
+            if d.get("value") is None:
+                print(f"     {label:<18}       —")
+                continue
+            print(f"     {label:<18} {d['value']:>+10.4f} "
+                  f"{d['null_mean']:>+11.4f} {d['null_sd']:>9.4f} "
+                  f"{d['percentile']:>7.1f}% {d['p_value_two_sided']:>8.4f}")
+        print(f"\n     false positive rate  {pe['false_positive_rate_pct']:.1f}%"
+              f"  of random studies would have printed |t| >= 2")
+        print(f"     {pe['verdict']} — {pe['reading']}")
+
+    # --- wrong asset --------------------------------------------------------
+    wa = t["wrong_asset"]
+    print(f"\n  5. WRONG-ASSET CONTROL  —  does it 'predict' things it "
+          f"shouldn't?")
+    if "error" in wa:
+        print(f"     ERROR: {wa['error']}")
+    else:
+        print(f"     native  {wa['native_symbol']:<10} "
+              f"IC {wa['native_ic']:>+9.5f}  (n={wa['native_n']:,})")
+        for cc in wa["controls"]:
+            if not cc.get("available"):
+                print(f"     control {cc['symbol']:<10} not loaded — "
+                      f"{cc['hint']}")
+                continue
+            print(f"     control {cc['symbol']:<10} IC {cc['ic']:>+9.5f}  "
+                  f"(n={cc['n']:,})  {100 * cc['ratio_vs_native']:.0f}% of "
+                  f"native")
+        print(f"     {wa['verdict']} — {wa['reading']}")
+
+    # --- summary ------------------------------------------------------------
+    print(f"\n{BAR}\n  VERDICTS\n{BAR}\n")
+    for name, verdict in res["summary"].items():
+        print(f"    {name:<20} {verdict}")
+    print(f"\n  Saved as run #{res.get('run_id')}\n")
+
+
+def do_controls(start: str = "2025-01-01", end: str = "2026-01-01") -> None:
+    import validation
+
+    print(f"\n{BAR}\n  CONTROL SERIES BACKFILL  {start} .. {end}\n{BAR}\n")
+    print("  These are non-crypto price series used only as a negative")
+    print("  control. They are never traded and never scored.\n")
+    res = validation.backfill_control_series(start_date=start, end_date=end)
+    if "error" in res:
+        print(f"  ERROR: {res['error']}\n")
+        return
+    for sym, info in res.items():
+        if "error" in info:
+            print(f"  {sym:<8} FAILED — {info['error']}")
+        else:
+            print(f"  {sym:<8} {info['candles']:>7,} candles"
+                  + (f"   ({info['note']})" if info.get("note") else ""))
+    print()
+
+
 def list_backtests() -> None:
     store.init_db()
     rows = store.list_backtests()
@@ -563,6 +780,11 @@ MENU = f"""
   15. List saved paper runs
   16. Inspect a paper run
 
+  VALIDATION (is the signal real?)
+  17. Lead-lag test (does the signal lead price, or follow it?)
+  18. Full validation (lead-lag + four null controls)
+  19. Fetch non-crypto control series (SPY / GLD)
+
    0. Exit
 {'-' * 68}"""
 
@@ -625,6 +847,20 @@ def menu() -> None:
             rid = input("  Run id: ").strip()
             if rid:
                 show_paper_run(rid)
+        elif choice == "17":
+            a = input("  Asset [BTC]: ").strip().upper() or "BTC"
+            s = input("  Start date [2025-01-01]: ").strip() or "2025-01-01"
+            e = input("  End date   [2026-01-01]: ").strip() or "2026-01-01"
+            do_leadlag(a, s, e)
+        elif choice == "18":
+            a = input("  Asset [BTC]: ").strip().upper() or "BTC"
+            s = input("  Start date [2025-01-01]: ").strip() or "2025-01-01"
+            e = input("  End date   [2026-01-01]: ").strip() or "2026-01-01"
+            do_validate(a, s, e)
+        elif choice == "19":
+            s = input("  Start date [2025-01-01]: ").strip() or "2025-01-01"
+            e = input("  End date   [2026-01-01]: ").strip() or "2026-01-01"
+            do_controls(s, e)
         elif choice == "0":
             logger.info("User exited the application.")
             print("  Goodbye.\n")
@@ -679,6 +915,14 @@ def cli() -> None:
     elif cmd == "events":
         do_event_study((arg or "BTC").upper(), arg2 or "2025-01-01",
                        arg3 or "2026-01-01")
+    elif cmd == "validate":
+        do_validate((arg or "BTC").upper(), arg2 or "2025-01-01",
+                    arg3 or "2026-01-01")
+    elif cmd in ("leadlag", "lead-lag"):
+        do_leadlag((arg or "BTC").upper(), arg2 or "2025-01-01",
+                   arg3 or "2026-01-01")
+    elif cmd == "controls":
+        do_controls(arg or "2025-01-01", arg2 or "2026-01-01")
     elif cmd == "backtests":
         list_backtests()
     elif cmd == "paper":
