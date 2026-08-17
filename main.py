@@ -2,7 +2,8 @@
 Apollo — news aggregation and crypto signal terminal.
 
 Usage:
-    python main.py                  interactive menu
+    python main.py                  Apollo terminal (interactive shell)
+    python main.py menu             legacy numbered menu
     python main.py run              start the collector daemon (Ctrl+C to stop)
     python main.py once             single collection pass across all sources
     python main.py signals          print current signals
@@ -10,6 +11,16 @@ Usage:
     python main.py top [asset]      highest-impact recent articles
     python main.py stats            database statistics
     python main.py export [file]    dump articles to JSONL
+
+Backtesting & paper trading:
+    python main.py backfill [start] [end]     historical prices + news
+    python main.py coverage                   what history is loaded
+    python main.py backtest [asset] [start] [end]
+    python main.py events [asset] [start] [end]   event study (CAR by category)
+    python main.py backtests                  list saved backtest runs
+    python main.py paper [duration]           paper trade (default 1h, $10k)
+    python main.py papers                     list saved paper runs
+    python main.py paperrun <id>              detail for one paper run
 """
 from __future__ import annotations
 
@@ -211,6 +222,318 @@ def export(path: str = "apollo_export.jsonl") -> None:
 
 
 # ---------------------------------------------------------------------------
+# Backtesting & paper trading
+# ---------------------------------------------------------------------------
+
+def do_backfill(start: str = "2025-01-01", end: str = "2026-01-01") -> None:
+    import historical
+
+    print(f"\n{BAR}\n  HISTORICAL BACKFILL  {start} .. {end}\n{BAR}\n")
+    if not (config_has_alpaca()):
+        print("  NOTE: ALPACA_API_KEY/SECRET not set in .env.")
+        print("        Prices and Fear & Greed will backfill, but news will NOT.")
+        print("        Alpaca is the only deep news archive wired up — without")
+        print("        it a news-driven backtest has nothing to test.\n")
+
+    res = historical.main(start, end)
+    print(f"\n{BAR}\n  BACKFILL COMPLETE\n{BAR}\n")
+    for label, n in (res.get("candles") or {}).items():
+        print(f"  candles  {label:<18} {n:>8,}")
+    if "fear_greed" in res:
+        print(f"  fear&greed{'':<18} {res['fear_greed']:>7,} readings")
+    if "news" in res:
+        print(f"  news     {'new':<18} {res['news']['new']:>8,}")
+        print(f"  news     {'duplicate':<18} {res['news']['duplicate']:>8,}")
+    print()
+
+
+def config_has_alpaca() -> bool:
+    from config import ALPACA_API_KEY, ALPACA_SECRET_KEY
+    return bool(ALPACA_API_KEY and ALPACA_SECRET_KEY)
+
+
+def show_coverage() -> None:
+    import historical
+
+    cov = historical.coverage_report()
+    store.init_db()
+    print(f"\n{BAR}\n  HISTORICAL DATA COVERAGE\n{BAR}\n")
+    for product, gran in cov.items():
+        print(f"  {product}")
+        for g, info in gran.items():
+            if info["count"]:
+                print(f"    {g:<4} {info['count']:>7,} candles   "
+                      f"{info['start'][:10]} .. {info['end'][:10]}")
+            else:
+                print(f"    {g:<4} {'(none)':>7}")
+
+    row = store.get_conn().execute(
+        "SELECT COUNT(*) c, MIN(published_at) lo, MAX(published_at) hi"
+        " FROM articles WHERE published_at IS NOT NULL").fetchone()
+    print(f"\n  Articles: {row['c']:,}")
+    if row["c"]:
+        print(f"    {str(row['lo'])[:10]} .. {str(row['hi'])[:10]}")
+    print()
+
+
+def do_backtest(asset: str = "BTC", start: str = "2025-01-01",
+                end: str = "2026-01-01") -> None:
+    import backtest
+
+    print(f"\n  Backtesting {asset.upper()}  {start} .. {end} ...\n")
+    res = backtest.run(asset=asset, start_date=start, end_date=end)
+
+    if "error" in res:
+        print(f"  ERROR: {res['error']}\n")
+        return
+
+    m = res["metrics"]
+    print(f"{BAR}\n  BACKTEST — {res['asset']} ({res['symbol']})  "
+          f"{start} .. {end}\n{BAR}\n")
+    print(f"  Bars                {m['bars_total']:,}")
+    print(f"  Bars with news      {m['bars_with_news']:,} "
+          f"({m['news_coverage_pct']}%)")
+    print(f"  Articles loaded     {res['articles_loaded']:,}")
+
+    if m.get("warning"):
+        print(f"\n  WARNING: {m['warning']}\n")
+        return
+
+    print(f"\n  PREDICTIVE POWER BY HORIZON")
+    print(f"  {'horizon':>8} {'n':>7} {'IC':>8} {'hit%':>7} "
+          f"{'signal ret%':>12} {'t-stat':>8} {'L/S spread%':>12}")
+    print("  " + "-" * 68)
+    for h, d in m["horizons"].items():
+        if d.get("note"):
+            print(f"  {h:>8} {d['n']:>7}  {d['note']}")
+            continue
+        print(f"  {h:>8} {d['n']:>7} {d['information_coefficient']:>8.4f} "
+              f"{(d['hit_rate_pct'] or 0):>7.2f} "
+              f"{(d['signal_following_mean_pct'] or 0):>12.4f} "
+              f"{(d['signal_following_tstat'] or 0):>8.3f} "
+              f"{(d['long_short_decile_spread_pct'] or 0):>12.4f}")
+
+    first = next(iter(m["horizons"].values()), {})
+    if first.get("deciles"):
+        print(f"\n  SIGNAL DECILES ({next(iter(m['horizons']))} forward return)")
+        print(f"  {'decile':>7} {'n':>6} {'mean signal':>13} {'mean fwd ret%':>15}")
+        print("  " + "-" * 45)
+        for d in first["deciles"]:
+            print(f"  {d['decile']:>7} {d['n']:>6} {d['mean_signal']:>13.4f} "
+                  f"{d['mean_fwd_return_pct']:>15.4f}")
+
+    if first.get("by_direction"):
+        print(f"\n  BY SIGNAL DIRECTION")
+        print(f"  {'direction':<18} {'n':>7} {'mean fwd ret%':>15} {'win%':>8}")
+        print("  " + "-" * 52)
+        for name, d in first["by_direction"].items():
+            print(f"  {name:<18} {d['n']:>7} {d['mean_fwd_return_pct']:>15.4f} "
+                  f"{d['win_rate_pct']:>8.2f}")
+
+    s = res["strategy"]
+    if "error" not in s:
+        print(f"\n  STRATEGY SIMULATION (fees included)")
+        print(f"    Starting cash       ${s['starting_cash']:>12,.2f}")
+        print(f"    Ending equity       ${s['ending_equity']:>12,.2f}  "
+              f"({s['return_pct']:+.2f}%)")
+        print(f"    Buy & hold          ${s['buy_hold_equity']:>12,.2f}  "
+              f"({s['buy_hold_return_pct']:+.2f}%)")
+        print(f"    Excess vs B&H        {s['excess_vs_buy_hold_pct']:>+12.2f}%")
+        print(f"    Trades               {s['trades']:>12,}")
+        print(f"    Max drawdown         {s['max_drawdown_pct']:>+12.2f}%")
+        if s.get("sharpe_annualized") is not None:
+            print(f"    Sharpe (annualized)  {s['sharpe_annualized']:>12.3f}")
+
+    print(f"\n  Saved as backtest run #{res.get('run_id')}\n")
+
+
+def do_event_study(asset: str = "BTC", start: str = "2025-01-01",
+                   end: str = "2026-01-01") -> None:
+    import event_study
+
+    print(f"\n  Event study — {asset.upper()}  {start} .. {end} ...\n")
+    res = event_study.run_study(asset=asset, start_date=start, end_date=end)
+
+    if "error" in res:
+        print(f"  ERROR: {res['error']}\n")
+        return
+
+    w = res["window"]
+    print(f"{BAR}\n  EVENT STUDY — {res['asset']} ({res['symbol']})  "
+          f"{start} .. {end}\n{BAR}\n")
+    print(f"  Event window        -{w['pre_bars']}h .. +{w['post_bars']}h")
+    print(f"  Baseline            {w['estimation_bars']}h ending "
+          f"{w['estimation_gap_bars']}h before each event")
+    print(f"  Events detected     {res['events_detected']:,}")
+    print(f"  After dedupe        {res['events_after_dedupe']:,}")
+    print(f"  Measured            {res['events_measured']:,}")
+
+    o = res["overall"]
+    if o.get("signed_by_prior_mean_pct") is not None:
+        print(f"\n  OVERALL (trading each event in its expected direction)")
+        print(f"    Mean abnormal return  {o['signed_by_prior_mean_pct']:>+8.4f}%")
+        print(f"    t-statistic           {o['signed_by_prior_tstat']:>8.3f}")
+        print(f"    Events                {o['n_signed']:>8,}")
+
+    print(f"\n  BY EVENT CATEGORY  (CAR = cumulative abnormal return, post-event)")
+    print(f"  {'category':<24} {'n':>4} {'exp':>4} {'CAR%':>9} {'t':>7} "
+          f"{'pos%':>6} {'prior✓':>7} {'lex✓':>6}")
+    print("  " + "-" * 76)
+
+    rows = [(k, v) for k, v in res["categories"].items() if not v.get("note")]
+    rows.sort(key=lambda kv: -abs(kv[1]["tstat_car_post"]))
+    for cat, d in rows:
+        exp = {1: "bull", -1: "bear", 0: "—"}.get(d["expected_direction"], "?")
+        prior = (f"{d['direction_agreement_pct']:.0f}%"
+                 if d["direction_agreement_pct"] is not None else "  —")
+        lex = (f"{d['lexicon_agreement_pct']:.0f}%"
+               if d["lexicon_agreement_pct"] is not None else "  —")
+        flag = " *" if abs(d["tstat_car_post"]) >= 2 else ""
+        print(f"  {cat:<24} {d['n']:>4} {exp:>4} {d['mean_car_post_pct']:>+9.3f} "
+              f"{d['tstat_car_post']:>7.2f} {d['pct_positive']:>5.0f}% "
+              f"{prior:>7} {lex:>6}{flag}")
+
+    skipped = [(k, v) for k, v in res["categories"].items() if v.get("note")]
+    if skipped:
+        print(f"\n  Too few events to report: "
+              f"{', '.join(f'{k}({v[chr(110)]})' for k, v in skipped)}")
+
+    print(f"\n  * = |t| >= 2 (conventionally significant)")
+
+    if rows:
+        top = rows[0]
+        print(f"\n  STRONGEST CATEGORY — {top[0]}")
+        print(f"    Mean abnormal return by hour after event:")
+        aar = top[1]["aar_by_bar_pct"]
+        pre_n = w["pre_bars"]
+        line = "      "
+        for i, v in enumerate(aar[:16]):
+            tag = f"{i - pre_n:+d}h"
+            line += f"{tag}:{v:+.3f}  "
+            if (i + 1) % 4 == 0:
+                print(line)
+                line = "      "
+        if line.strip():
+            print(line)
+        print(f"\n    Largest moves:")
+        for ex in top[1]["examples"]:
+            print(f"      {ex['car_post_pct']:>+8.3f}%  {ex['ts']}  "
+                  f"{ex['title'][:60]}")
+
+    print(f"\n  Saved as run #{res.get('run_id')}\n")
+
+
+def list_backtests() -> None:
+    store.init_db()
+    rows = store.list_backtests()
+    print(f"\n{BAR}\n  SAVED BACKTEST RUNS\n{BAR}\n")
+    if not rows:
+        print("  None yet.\n")
+        return
+    for r in rows:
+        print(f"  #{r['id']:<4} {r['run_at'][:16]}  {r['asset']:<6} "
+              f"{r['start_date']} .. {r['end_date']}  {r['label'] or ''}")
+    print()
+
+
+def do_paper(duration: str = "1h", assets: str | None = None) -> None:
+    import paper_trader
+
+    print(f"\n{BAR}\n  PAPER TRADING — SIMULATED, NO REAL ORDERS\n{BAR}")
+    print(f"\n  Starting cash : ${paper_trader.STARTING_CASH:,.2f}")
+    print(f"  Duration      : {duration}")
+    print(f"  Assets        : {assets or 'BTC,ETH,SOL'}")
+    print(f"\n  Ctrl+C to stop early (the run is still saved).\n")
+
+    kwargs = {"duration": duration}
+    if assets:
+        kwargs["assets"] = [a.strip().upper() for a in assets.split(",")]
+    summary = paper_trader.main(**kwargs)
+
+    if summary.get("status") == "stopped" and "ending_equity" not in summary:
+        print("\n  Stopped before the first tick completed.\n")
+        return
+
+    print(f"\n{BAR}\n  RESULT — run #{summary.get('run_id')}\n{BAR}\n")
+    print(f"  Starting cash   ${summary['starting_cash']:>12,.2f}")
+    print(f"  Ending equity   ${summary['ending_equity']:>12,.2f}  "
+          f"({summary['return_pct']:+.2f}%)")
+    print(f"  Realized P&L    ${summary['realized_pnl']:>12,.2f}")
+    print(f"  Fees paid       ${summary['fees_paid']:>12,.2f}")
+    print(f"  Final cash      ${summary['final_cash']:>12,.2f}")
+    print(f"  Ticks           {summary['ticks']:>13,}")
+    if summary.get("final_positions"):
+        print(f"\n  Final positions:")
+        for a, p in summary["final_positions"].items():
+            print(f"    {a:<6} {p['qty']:>14.8f} @ ${p['price']:>12,.2f}"
+                  f"  = ${p['value']:>10,.2f}")
+    print()
+
+
+def list_papers() -> None:
+    store.init_db()
+    rows = store.list_paper_runs()
+    print(f"\n{BAR}\n  SAVED PAPER TRADING RUNS\n{BAR}\n")
+    if not rows:
+        print("  None yet. Start one with: python main.py paper 1h\n")
+        return
+    print(f"  {'id':<5} {'started':<17} {'status':<10} {'start$':>10} "
+          f"{'end$':>11} {'ret%':>8}")
+    print("  " + "-" * 66)
+    for r in rows:
+        end_eq = r["ending_equity"]
+        ret = (100 * (end_eq / r["starting_cash"] - 1)
+               if end_eq and r["starting_cash"] else 0.0)
+        print(f"  {r['id']:<5} {r['started_at'][:16]:<17} "
+              f"{(r['status'] or ''):<10} {r['starting_cash']:>10,.0f} "
+              f"{(end_eq or 0):>11,.2f} {ret:>+8.2f}")
+    print()
+
+
+def show_paper_run(run_id: str) -> None:
+    store.init_db()
+    try:
+        data = store.get_paper_run(int(run_id))
+    except (ValueError, TypeError):
+        print("\n  Invalid run id.\n")
+        return
+    if not data:
+        print(f"\n  No paper run #{run_id}.\n")
+        return
+
+    import json as _json
+    r = data["run"]
+    print(f"\n{BAR}\n  PAPER RUN #{r['id']} — {r['label']}\n{BAR}\n")
+    print(f"  Status        {r['status']}")
+    print(f"  Started       {r['started_at']}")
+    print(f"  Ended         {r['ended_at'] or '(still running)'}")
+    print(f"  Starting cash ${r['starting_cash']:,.2f}")
+    if r["ending_equity"]:
+        print(f"  Ending equity ${r['ending_equity']:,.2f}  "
+              f"({100 * (r['ending_equity'] / r['starting_cash'] - 1):+.2f}%)")
+
+    trades = data["trades"]
+    print(f"\n  TRADES ({len(trades)})")
+    if trades:
+        print(f"  {'time':<17} {'side':<5} {'asset':<6} {'qty':>14} "
+              f"{'price':>12} {'P&L':>10}")
+        print("  " + "-" * 70)
+        for t in trades[:60]:
+            print(f"  {t['ts'][:16]:<17} {t['side']:<5} {t['symbol']:<6} "
+                  f"{t['qty']:>14.8f} {t['price']:>12,.2f} "
+                  f"{(t['realized_pnl'] or 0):>10,.2f}")
+        if len(trades) > 60:
+            print(f"  ... and {len(trades) - 60} more")
+
+    eq = data["equity"]
+    if eq:
+        vals = [e["equity"] for e in eq]
+        print(f"\n  EQUITY  min ${min(vals):,.2f}  max ${max(vals):,.2f}  "
+              f"samples {len(vals):,}")
+    print()
+
+
+# ---------------------------------------------------------------------------
 # Interactive menu
 # ---------------------------------------------------------------------------
 
@@ -218,22 +541,36 @@ MENU = f"""
 {BAR}
   APOLLO — NEWS AGGREGATION & CRYPTO SIGNAL TERMINAL
 {BAR}
-  1. Start collector daemon (continuous, all sources)
-  2. Run one collection pass now
-  3. View current signals (BTC / ETH / SOL / MACRO)
-  4. View highest-impact articles
-  5. Feed health check
-  6. Database statistics
-  7. SEC filings lookup by ticker
-  8. Export articles to JSONL
-  9. Exit
+  COLLECTION
+   1. Start collector daemon (continuous, all sources)
+   2. Run one collection pass now
+   3. View current signals (BTC / ETH / SOL / MACRO)
+   4. View highest-impact articles
+   5. Feed health check
+   6. Database statistics
+   7. SEC filings lookup by ticker
+   8. Export articles to JSONL
+
+  BACKTESTING
+   9. Backfill historical data (prices + news)
+  10. Show historical data coverage
+  11. Run a backtest
+  12. Run an event study
+  13. List saved backtests / event studies
+
+  PAPER TRADING (simulated — no real orders)
+  14. Start a paper trading run
+  15. List saved paper runs
+  16. Inspect a paper run
+
+   0. Exit
 {'-' * 68}"""
 
 
 def menu() -> None:
     while True:
         print(MENU)
-        choice = input("  Select an option (1-9): ").strip()
+        choice = input("  Select an option: ").strip()
 
         if choice == "1":
             logger.info("User started the collector daemon.")
@@ -261,6 +598,34 @@ def menu() -> None:
             p = input("  Output path [apollo_export.jsonl]: ").strip()
             export(p or "apollo_export.jsonl")
         elif choice == "9":
+            s = input("  Start date [2025-01-01]: ").strip() or "2025-01-01"
+            e = input("  End date   [2026-01-01]: ").strip() or "2026-01-01"
+            do_backfill(s, e)
+        elif choice == "10":
+            show_coverage()
+        elif choice == "11":
+            a = input("  Asset [BTC]: ").strip().upper() or "BTC"
+            s = input("  Start date [2025-01-01]: ").strip() or "2025-01-01"
+            e = input("  End date   [2026-01-01]: ").strip() or "2026-01-01"
+            do_backtest(a, s, e)
+        elif choice == "12":
+            a = input("  Asset [BTC]: ").strip().upper() or "BTC"
+            s = input("  Start date [2025-01-01]: ").strip() or "2025-01-01"
+            e = input("  End date   [2026-01-01]: ").strip() or "2026-01-01"
+            do_event_study(a, s, e)
+        elif choice == "13":
+            list_backtests()
+        elif choice == "14":
+            d = input("  Duration (e.g. 1h, 30m, 7d, 0=unbounded) [1h]: ").strip() or "1h"
+            a = input("  Assets [BTC,ETH,SOL]: ").strip()
+            do_paper(d, a or None)
+        elif choice == "15":
+            list_papers()
+        elif choice == "16":
+            rid = input("  Run id: ").strip()
+            if rid:
+                show_paper_run(rid)
+        elif choice == "0":
             logger.info("User exited the application.")
             print("  Goodbye.\n")
             break
@@ -269,14 +634,25 @@ def menu() -> None:
 
 
 def cli() -> None:
+    # No arguments -> the full terminal. The numbered menu is still reachable
+    # via `python main.py menu` for anyone who prefers it.
     if len(sys.argv) < 2:
-        menu()
+        import terminal
+        terminal.main([])
         return
 
     cmd = sys.argv[1].lower()
     arg = sys.argv[2] if len(sys.argv) > 2 else None
 
-    if cmd == "run":
+    arg2 = sys.argv[3] if len(sys.argv) > 3 else None
+    arg3 = sys.argv[4] if len(sys.argv) > 4 else None
+
+    if cmd in ("term", "terminal", "shell"):
+        import terminal
+        terminal.main(sys.argv[2:])
+    elif cmd == "menu":
+        menu()
+    elif cmd == "run":
         only = arg.split(",") if arg else None
         daemon.main(only=only)
     elif cmd == "once":
@@ -293,6 +669,24 @@ def cli() -> None:
         lookup_ticker((arg or "").upper())
     elif cmd == "export":
         export(arg or "apollo_export.jsonl")
+    elif cmd == "backfill":
+        do_backfill(arg or "2025-01-01", arg2 or "2026-01-01")
+    elif cmd == "coverage":
+        show_coverage()
+    elif cmd == "backtest":
+        do_backtest((arg or "BTC").upper(), arg2 or "2025-01-01",
+                    arg3 or "2026-01-01")
+    elif cmd == "events":
+        do_event_study((arg or "BTC").upper(), arg2 or "2025-01-01",
+                       arg3 or "2026-01-01")
+    elif cmd == "backtests":
+        list_backtests()
+    elif cmd == "paper":
+        do_paper(arg or "1h", arg2)
+    elif cmd == "papers":
+        list_papers()
+    elif cmd == "paperrun":
+        show_paper_run(arg or "")
     else:
         print(__doc__)
 

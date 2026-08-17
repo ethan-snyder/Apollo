@@ -6,6 +6,33 @@ Apollo continuously pulls news from ~90 sources, deduplicates it, tags each
 article to the assets it affects, scores it bullish/bearish, and rolls those
 scores into directional signals over multiple time horizons.
 
+## The terminal
+
+```
+python main.py
+```
+
+Opens the Apollo shell — a single typed-command interface over everything:
+collection, signals, backfill, backtesting, event studies, and paper trading.
+`help` lists all commands, `quit` exits.
+
+```
+  apollo ▸ sig btc          current signals across all windows
+  apollo ▸ top              highest-impact articles, last 24h
+  apollo ▸ why 4821         why one article scored the way it did
+  apollo ▸ watch            auto-refreshing signal monitor
+  apollo ▸ events btc       event study
+  apollo ▸ paper 1h         simulated trading run
+```
+
+Every command also works one-shot from a normal shell:
+`python main.py term sig btc`. The legacy numbered menu is still at
+`python main.py menu`.
+
+Colour is 24-bit where supported, with 256-colour and plain-text fallbacks.
+Windows VT mode is enabled automatically. `NO_COLOR=1` disables styling
+entirely, and output is auto-plain when piped or redirected.
+
 ## What it collects
 
 Everything below is free. Nothing in the first four groups needs an API key.
@@ -73,14 +100,34 @@ FROM signals WHERE asset='BTC' AND window_min=60
 ORDER BY computed_at DESC;
 ```
 
+## Backtesting & paper trading
+
+```
+python main.py backfill 2025-01-01 2026-01-01   # historical prices + news
+python main.py coverage                          # what history is loaded
+python main.py backtest BTC 2025-01-01 2026-01-01
+python main.py paper 1h                          # simulated trading, $10k
+```
+
+Paper trading is **simulated only** — no broker is contacted and no real
+orders are placed. Runs persist for later analysis.
+
+See **[BACKTESTING.md](BACKTESTING.md)** for the full guide: how look-ahead
+bias is prevented, how to read IC / hit rate / decile tables, and the
+important caveat that historical *news* (unlike prices) is only available via
+Alpaca's keyed archive.
+
 ## Architecture
 
 ```
-main.py       CLI + interactive menu
-daemon.py     async orchestrator; runs all collectors concurrently
-config.py     feed registry, assets, cadences, weights
-store.py      SQLite, dedup, queries
-scoring.py    tagging, sentiment lexicon, signal aggregation (gitignored)
+main.py         CLI + interactive menu
+daemon.py       async orchestrator; runs all collectors concurrently
+config.py       feed registry, assets, cadences, weights
+store.py        SQLite, dedup, queries
+scoring.py      tagging, sentiment lexicon, signal aggregation (gitignored)
+historical.py   backfill: Coinbase OHLCV, Alpaca news archive, Fear & Greed
+backtest.py     chronological replay + predictive-power metrics
+paper_trader.py simulated trading engine with run persistence
 collectors/
   base.py         Collector ABC, HTTP client w/ retry + conditional GET
   rss.py          ~68-feed firehose
@@ -232,20 +279,50 @@ source):
 python main.py run rss,coingecko
 ```
 
-## 9. Everything in one place
+## 9. Backfill history and backtest
+
+```
+python main.py backfill 2025-01-01 2026-01-01
+python main.py coverage
+python main.py backtest BTC 2025-01-01 2026-01-01
+python main.py backtests
+```
+
+The backfill is slow (news paging dominates) but idempotent — safe to re-run
+over the same range. Historical *news* requires Alpaca keys in `.env`; prices
+and Fear & Greed backfill without any key. See
+[BACKTESTING.md](BACKTESTING.md) for how to interpret the output.
+
+## 10. Paper trade (simulated)
+
+```
+python main.py paper 1h                 # 1 hour, $10,000 starting cash
+python main.py paper 7d                 # one week
+python main.py paper 0                  # unbounded, Ctrl+C to stop
+python main.py paper 4h BTC,ETH         # specific assets only
+
+python main.py papers                   # list past runs
+python main.py paperrun 3               # trade log for run #3
+```
+
+No broker is contacted and no real orders are placed. Ctrl+C stops early and
+still saves the run.
+
+## 11. Everything in one place
 
 Running `python main.py` with no arguments opens an interactive menu covering
 all of the above — useful if you'd rather not remember the subcommands.
 
-## 10. Run the test suite
+## 12. Run the test suites
 
 ```
-python test_apollo.py
+python test_apollo.py       # 64 checks — scoring, dedup, parsing
+python test_backtest.py     # 67 checks — look-ahead, stats, accounting
 ```
 
-64 offline checks, no network required. Run this after editing `config.py` or
-any collector to catch import errors and structural regressions before they
-show up mid-run.
+131 offline checks total, no network required. Run these after editing
+`config.py`, `scoring.py`, or any collector to catch import errors and
+regressions before they show up mid-run.
 
 ## Common issues
 

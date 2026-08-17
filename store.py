@@ -123,6 +123,81 @@ CREATE TABLE IF NOT EXISTS signals (
     detail        TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_signals_asset ON signals(asset, computed_at DESC);
+
+-- ---------------------------------------------------------------------------
+-- Backtesting and paper trading
+-- ---------------------------------------------------------------------------
+
+-- Historical OHLCV candles. granularity is in seconds (3600 = 1h, 86400 = 1d).
+CREATE TABLE IF NOT EXISTS ohlcv (
+    symbol      TEXT NOT NULL,
+    granularity INTEGER NOT NULL,
+    ts          TEXT NOT NULL,        -- ISO8601 UTC, candle OPEN time
+    open        REAL, high REAL, low REAL, close REAL, volume REAL,
+    PRIMARY KEY (symbol, granularity, ts)
+);
+CREATE INDEX IF NOT EXISTS idx_ohlcv_lookup ON ohlcv(symbol, granularity, ts);
+
+-- One row per backtest execution, with full params and results as JSON so
+-- runs stay comparable after the code changes underneath them.
+CREATE TABLE IF NOT EXISTS backtest_runs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_at      TEXT NOT NULL,
+    label       TEXT,
+    asset       TEXT,
+    start_date  TEXT,
+    end_date    TEXT,
+    params      TEXT,
+    results     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_backtest_run_at ON backtest_runs(run_at DESC);
+
+-- A paper trading session.
+CREATE TABLE IF NOT EXISTS paper_runs (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    label         TEXT,
+    started_at    TEXT NOT NULL,
+    ended_at      TEXT,
+    status        TEXT,               -- running | completed | stopped | error
+    starting_cash REAL NOT NULL,
+    ending_equity REAL,
+    params        TEXT,
+    summary       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_paper_runs_started ON paper_runs(started_at DESC);
+
+-- Every simulated fill.
+CREATE TABLE IF NOT EXISTS paper_trades (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id           INTEGER NOT NULL,
+    ts               TEXT NOT NULL,
+    symbol           TEXT NOT NULL,
+    side             TEXT NOT NULL,   -- BUY | SELL
+    qty              REAL,
+    price            REAL,
+    notional         REAL,
+    fee              REAL,
+    reason           TEXT,
+    signal_direction TEXT,
+    net_impact       REAL,
+    confidence       REAL,
+    cash_after       REAL,
+    position_after   REAL,
+    realized_pnl     REAL,
+    FOREIGN KEY (run_id) REFERENCES paper_runs(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_paper_trades_run ON paper_trades(run_id, ts);
+
+-- Equity curve samples, one per evaluation tick.
+CREATE TABLE IF NOT EXISTS paper_equity (
+    run_id    INTEGER NOT NULL,
+    ts        TEXT NOT NULL,
+    equity    REAL,
+    cash      REAL,
+    positions TEXT,                   -- JSON {symbol: {qty, price, value}}
+    PRIMARY KEY (run_id, ts),
+    FOREIGN KEY (run_id) REFERENCES paper_runs(id) ON DELETE CASCADE
+);
 """
 
 _TRACKING_PARAMS = re.compile(
@@ -505,6 +580,147 @@ def stats() -> dict:
         ).fetchall()
     ]
     return out
+
+
+# ---------------------------------------------------------------------------
+# OHLCV
+# ---------------------------------------------------------------------------
+
+def upsert_candles(symbol: str, granularity: int, rows: Iterable[tuple]) -> int:
+    """
+    rows: (ts_iso, open, high, low, close, volume).
+
+    INSERT OR REPLACE so re-running a backfill over the same range is safe and
+    idempotent (exchanges occasionally revise recent candles).
+    """
+    rows = list(rows)
+    if not rows:
+        return 0
+    with tx() as conn:
+        conn.executemany(
+            "INSERT OR REPLACE INTO ohlcv (symbol, granularity, ts, open, high,"
+            " low, close, volume) VALUES (?,?,?,?,?,?,?,?)",
+            [(symbol, granularity, *r) for r in rows],
+        )
+    return len(rows)
+
+
+def get_candles(symbol: str, granularity: int, start: str | None = None,
+                end: str | None = None) -> list[sqlite3.Row]:
+    sql = "SELECT * FROM ohlcv WHERE symbol = ? AND granularity = ?"
+    params: list[Any] = [symbol, granularity]
+    if start:
+        sql += " AND ts >= ?"
+        params.append(start)
+    if end:
+        sql += " AND ts <= ?"
+        params.append(end)
+    sql += " ORDER BY ts"
+    return get_conn().execute(sql, params).fetchall()
+
+
+def candle_coverage(symbol: str, granularity: int) -> dict:
+    row = get_conn().execute(
+        "SELECT COUNT(*) n, MIN(ts) lo, MAX(ts) hi FROM ohlcv"
+        " WHERE symbol = ? AND granularity = ?", (symbol, granularity)
+    ).fetchone()
+    return {"count": row["n"], "start": row["lo"], "end": row["hi"]}
+
+
+# ---------------------------------------------------------------------------
+# Backtest / paper run persistence
+# ---------------------------------------------------------------------------
+
+def save_backtest(label: str, asset: str, start_date: str, end_date: str,
+                  params: dict, results: dict) -> int:
+    with tx() as conn:
+        cur = conn.execute(
+            "INSERT INTO backtest_runs (run_at, label, asset, start_date,"
+            " end_date, params, results) VALUES (?,?,?,?,?,?,?)",
+            (utcnow(), label, asset, start_date, end_date,
+             json.dumps(params, default=str), json.dumps(results, default=str)),
+        )
+        return cur.lastrowid
+
+
+def list_backtests(limit: int = 20) -> list[sqlite3.Row]:
+    return get_conn().execute(
+        "SELECT id, run_at, label, asset, start_date, end_date FROM backtest_runs"
+        " ORDER BY run_at DESC LIMIT ?", (limit,)
+    ).fetchall()
+
+
+def get_backtest(run_id: int) -> sqlite3.Row | None:
+    return get_conn().execute(
+        "SELECT * FROM backtest_runs WHERE id = ?", (run_id,)).fetchone()
+
+
+def create_paper_run(label: str, starting_cash: float, params: dict) -> int:
+    with tx() as conn:
+        cur = conn.execute(
+            "INSERT INTO paper_runs (label, started_at, status, starting_cash,"
+            " params) VALUES (?,?,?,?,?)",
+            (label, utcnow(), "running", starting_cash,
+             json.dumps(params, default=str)),
+        )
+        return cur.lastrowid
+
+
+def finish_paper_run(run_id: int, status: str, ending_equity: float,
+                     summary: dict) -> None:
+    with tx() as conn:
+        conn.execute(
+            "UPDATE paper_runs SET ended_at = ?, status = ?, ending_equity = ?,"
+            " summary = ? WHERE id = ?",
+            (utcnow(), status, ending_equity,
+             json.dumps(summary, default=str), run_id),
+        )
+
+
+def record_trade(run_id: int, ts: str, symbol: str, side: str, qty: float,
+                 price: float, fee: float, reason: str, signal_direction: str,
+                 net_impact: float, confidence: float, cash_after: float,
+                 position_after: float, realized_pnl: float = 0.0) -> None:
+    with tx() as conn:
+        conn.execute(
+            """INSERT INTO paper_trades (run_id, ts, symbol, side, qty, price,
+               notional, fee, reason, signal_direction, net_impact, confidence,
+               cash_after, position_after, realized_pnl)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (run_id, ts, symbol, side, qty, price, qty * price, fee, reason,
+             signal_direction, net_impact, confidence, cash_after,
+             position_after, realized_pnl),
+        )
+
+
+def record_equity(run_id: int, ts: str, equity: float, cash: float,
+                  positions: dict) -> None:
+    with tx() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO paper_equity (run_id, ts, equity, cash,"
+            " positions) VALUES (?,?,?,?,?)",
+            (run_id, ts, equity, cash, json.dumps(positions, default=str)),
+        )
+
+
+def list_paper_runs(limit: int = 20) -> list[sqlite3.Row]:
+    return get_conn().execute(
+        "SELECT * FROM paper_runs ORDER BY started_at DESC LIMIT ?", (limit,)
+    ).fetchall()
+
+
+def get_paper_run(run_id: int) -> dict:
+    conn = get_conn()
+    run = conn.execute("SELECT * FROM paper_runs WHERE id = ?", (run_id,)).fetchone()
+    if not run:
+        return {}
+    return {
+        "run": dict(run),
+        "trades": [dict(r) for r in conn.execute(
+            "SELECT * FROM paper_trades WHERE run_id = ? ORDER BY ts", (run_id,))],
+        "equity": [dict(r) for r in conn.execute(
+            "SELECT * FROM paper_equity WHERE run_id = ? ORDER BY ts", (run_id,))],
+    }
 
 
 def export_jsonl(path: str, minutes: int | None = None) -> int:
