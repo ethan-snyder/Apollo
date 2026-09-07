@@ -1,10 +1,63 @@
 # Apollo
 
-News aggregation and real-time signal generation for BTC-USD, ETH-USD, and SOL-USD.
+> Real-time news aggregation and directional signal generation for
+> **BTC-USD, ETH-USD, and SOL-USD**.
 
-Apollo continuously pulls news from ~90 sources, deduplicates it, tags each
+Apollo continuously pulls from **~90 sources** — crypto press, protocol blogs,
+regulators, macro outlets, and keyless APIs — then deduplicates, tags each
 article to the assets it affects, scores it bullish/bearish, and rolls those
-scores into directional signals over multiple time horizons.
+scores into **BULLISH / BEARISH / NEUTRAL** signals over multiple time horizons.
+
+| Capability | What it does |
+|---|---|
+| Collect | RSS firehose, GDELT, CoinGecko, Fear & Greed, DeFiLlama, Federal Register, SEC EDGAR — all free out of the box |
+| Understand | Asset tagging, lexicon scoring with negation/hedge handling, per-article impact |
+| Signal | Multi-window aggregation with confidence, corroboration counting, live monitor |
+| Validate | Look-ahead-safe backtesting, event studies, simulated paper trading |
+
+```text
+apollo ▸ sig btc     current signals across all windows
+apollo ▸ top         highest-impact articles, last 24h
+apollo ▸ paper 1h    simulated trading run
+```
+
+See [The terminal](#the-terminal) or [Terminal Guide](#terminal-guide) to run it.
+
+## Version
+
+**Current: v2.0**
+
+| | |
+|---|---|
+| Status | Stable |
+| Python | 3.11 – 3.13 |
+| Store | SQLite (`apollo.db`, WAL mode) |
+| Keys required | None — runs fully keyless; optional keys add sources |
+
+## Recent updates
+
+> Kept short — one entry per release. Add new entries at the top.
+
+- **v2.0 — 2026-09-07** — README landing, versioning, and index added. No code changes.
+<!-- Template for the next release:
+- **v2.x — YYYY-MM-DD** — What changed, in one line. Why it matters, in a second line if needed.
+-->
+
+## Contents
+
+- [The terminal](#the-terminal)
+- [What it collects](#what-it-collects)
+- [How scoring works](#how-scoring-works-overview)
+- [Deduplication](#deduplication)
+- [Data model](#data-model)
+- [Backtesting & paper trading](#backtesting--paper-trading)
+- [Architecture](#architecture)
+- [Known limitations](#known-limitations)
+- [Next steps](#next-steps)
+- [Terminal Guide](#terminal-guide)
+- [Common issues](#common-issues)
+
+---
 
 ## The terminal
 
@@ -163,10 +216,13 @@ dedup, and persistence are handled by the base class.
 
 ## Next steps
 
-The `signals` table is designed to be joined against price data for
-calibration — that's the natural next piece. `score_detail` (stored per
-article) gives per-article labels usable as training data if you later want
-to replace the lexicon with a learned classifier.
+Planned work, in suggested order. Check off items as they land.
+
+- [ ] **Calibrate weights against price data** — join the `signals` table
+  against price history to fit source and lexicon weights (currently hand-set
+  priors). Needs accumulated live data first.
+- [ ] **Learned classifier** — use per-article `score_detail` as training
+  labels to replace or augment the lexicon scorer.
 
 ---
 
